@@ -1,0 +1,186 @@
+name: Domain Confusion & Takeover Hunter
+
+on:
+  schedule:
+    # Runs weekly at 00:00 UTC to catch expired domains
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+    inputs:
+      domains:
+        description: 'Target Domains separated by / (e.g., f.com/j.com)'
+        required: true
+        type: string
+      custom_saas_keywords:
+        description: 'SaaS keywords to grep for (e.g., okta, azure, salesforce, auth0, shopify) separated by spaces'
+        required: false
+        type: string
+      custom_extra_domains:
+        description: 'Any extra specific domains to check for confusion (separated by /)'
+        required: false
+        type: string
+
+jobs:
+  confusion-hunter:
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update > /dev/null 2>&1 && sudo apt-get install -y jq > /dev/null 2>&1
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest > /dev/null 2>&1
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest > /dev/null 2>&1
+          go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest > /dev/null 2>&1
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest > /dev/null 2>&1
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Update Nuclei Templates
+        run: nuclei -ut > /dev/null 2>&1
+
+      - name: Prepare Targets
+        run: |
+          touch main_targets.txt
+          echo "${{ github.event.inputs.domains }}" | tr '/' '\n' | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' >> main_targets.txt
+          
+          if [ -n "${{ github.event.inputs.custom_extra_domains }}" ]; then
+            echo "${{ github.event.inputs.custom_extra_domains }}" | tr '/' '\n' | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' >> main_targets.txt
+          fi
+          
+          sort -u main_targets.txt -o main_targets.txt
+          
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=🧩 Domain Confusion Hunter Starting for $(wc -l < main_targets.txt | xargs) targets..." || true
+
+      - name: Step 1 - Subdomain Enumeration
+        run: |
+          while IFS= read -r target; do
+            subfinder -d "$target" -silent -o "${target}_subs.txt" || true
+          done < main_targets.txt
+          cat *_subs.txt > all_subs.txt 2>/dev/null || true
+          touch all_subs.txt
+          sort -u all_subs.txt -o all_subs.txt
+
+      - name: Step 2 - Primary Domain Confusion Detection
+        run: |
+          > dead_roots.txt
+          > alive_subs.txt
+          
+          # 1. Check which subdomains are actually alive
+          cat all_subs.txt | httpx -silent -o alive_subs.txt || true
+          touch alive_subs.txt
+          
+          # 2. Extract ROOT domains from the subdomains (e.g., api.target.com -> target.com)
+          cat all_subs.txt | awk -F. '{print $(NF-1)"."$NF}' | sort -u > extracted_roots.txt
+          
+          # 3. Check if ROOT domains resolve. If they don't (NXDOMAIN), it's a CRITICAL Confusion vector
+          echo ">>> Checking for unregistered root domains (Primary Domain Confusion risk)..."
+          cat extracted_roots.txt | dnsx -json -a -silent | jq -r 'select(.a == null) | .host' >> dead_roots.txt 2>/dev/null || true
+          
+          if [ -s "dead_roots.txt" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+              -F chat_id="${TELEGRAM_CHAT_ID}" \
+              -F document="@dead_roots.txt" \
+              -F caption="🚨 CRITICAL: Unregistered Root Domains Found! (Primary Domain Confusion Risk)" || true
+          else
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=✅ All root domains are registered. No primary confusion risk." || true
+          fi
+
+      - name: Step 3 - CNAME & Replication Confusion Extraction
+        run: |
+          # Get CNAME records for all subdomains
+          echo ">>> Extracting CNAME records..."
+          cat all_subs.txt | dnsx -cname -silent -json | jq -r '.host + " -> " + (.cname | join(", "))' > cnames_raw.txt 2>/dev/null || true
+          
+          # Filter CNAMEs pointing to external cloud providers (Potential Takeover/Replication Confusion)
+          grep -iE "aws|cloudfront|heroku|shopify|azure|s3|fastly|cloudflare|github|atlassian" cnames_raw.txt > suspicious_cnames.txt 2>/dev/null || true
+          touch suspicious_cnames.txt
+          
+          if [ -s "suspicious_cnames.txt" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+              -F chat_id="${TELEGRAM_CHAT_ID}" \
+              -F document="@suspicious_cnames.txt" \
+              -F caption="☁️ Suspicious Cloud CNAMEs Found (Takeover/Replication Risk)" || true
+          fi
+
+      - name: Step 4 - Custom SaaS Keyword Filtering
+        env:
+          KEYWORDS: ${{ github.event.inputs.custom_saas_keywords }}
+        run: |
+          if [ -z "$KEYWORDS" ] || [ ! -s "alive_subs.txt" ]; then
+            echo "No custom keywords provided or no alive subs. Skipping."
+            exit 0
+          fi
+          
+          > custom_saas_hits.txt
+          echo ">>> Searching for custom SaaS keywords: $KEYWORDS"
+          
+          # Probe alive subs and extract the full response body/header to grep against
+          cat alive_subs.txt | httpx -silent -status-code -tech-detect -json -o httpx_full.json || true
+          
+          # Loop through user keywords and find matches
+          for keyword in $KEYWORDS; do
+            grep -i "$keyword" httpx_full.json | jq -r '.url + " [" + (.status_code|tostring) + "] - Tech: " + (.tech | join(", "))' >> custom_saas_hits.txt 2>/dev/null || true
+          done
+          
+          if [ -s "custom_saas_hits.txt" ]; then
+            sort -u custom_saas_hits.txt -o custom_saas_hits.txt
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+              -F chat_id="${TELEGRAM_CHAT_ID}" \
+              -F document="@custom_saas_hits.txt" \
+              -F caption="🎯 Custom SaaS Keyword Matches Found!" || true
+          else
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=✅ No matches found for keywords: $KEYWORDS" || true
+          fi
+
+      - name: Step 5 - Nuclei Takeover Verification
+        run: |
+          # We only feed the suspicious CNAMEs into Nuclei to verify if they are actually vulnerable
+          if [ ! -s "suspicious_cnames.txt" ]; then
+            echo "No suspicious CNAMEs to test."
+            exit 0
+          fi
+          
+          # Extract just the URLs from the suspicious CNAMEs file
+          awk '{print $1}' suspicious_cnames.txt > takeover_targets.txt
+          
+          echo ">>> Running Nuclei Takeover/Confusion templates..."
+          nuclei -l takeover_targets.txt -tags takeover,confusion -silent -o nuclei_takeover_results.txt || true
+          touch nuclei_takeover_results.txt
+          
+          if [ -s "nuclei_takeover_results.txt" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+              -F chat_id="${TELEGRAM_CHAT_ID}" \
+              -F document="@nuclei_takeover_results.txt" \
+              -F caption="🔥 CONFIRMED TAKEOVER / CONFUSION VULNERABILITIES!" || true
+          else
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=✅ Nuclei: Takeovers not possible on discovered CNAMEs (backends are active)." || true
+          fi
+
+      - name: Upload All Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: confusion-hunter-run-${{ github.run_id }}
+          path: |
+            *.txt
+            *.json
+          retention-days: 7
+
+      - name: Pipeline Finished
+        if: always()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=🛑 Domain Confusion & Takeover Pipeline Completely Finished." || true
